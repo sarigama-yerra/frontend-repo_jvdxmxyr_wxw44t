@@ -1,23 +1,27 @@
-import { createContext, useContext, useEffect, useMemo, useState } from 'react'
+import { createContext, useContext, useEffect, useMemo, useRef, useState } from 'react'
 
 const AuthContext = createContext(null)
 
-function inferApiBase() {
+function inferApiBaseCandidates() {
   const fromEnv = import.meta.env.VITE_BACKEND_URL
+  const cands = []
   if (fromEnv && typeof fromEnv === 'string' && fromEnv.trim()) {
-    return fromEnv.replace(/\/$/, '')
+    cands.push(fromEnv.replace(/\/$/, ''))
   }
   const { origin, hostname, protocol } = window.location
+  // Modal-style host rewrite (-3000 -> -8000)
   if (hostname.includes('-3000.')) {
-    return `${protocol}//${hostname.replace('-3000.', '-8000.')}`
+    cands.push(`${protocol}//${hostname.replace('-3000.', '-8000.')}`)
   }
+  // Local dev port rewrite
   if (origin.includes(':3000')) {
-    return origin.replace(':3000', ':8000')
+    cands.push(origin.replace(':3000', ':8000'))
   }
-  return origin
+  // Fallback to same origin (useful if frontend is served by backend proxy)
+  cands.push(origin)
+  // Deduplicate while preserving order
+  return [...new Set(cands)]
 }
-
-const API_BASE = inferApiBase()
 
 async function fetchWithTimeout(resource, options = {}, timeoutMs = 12000) {
   const controller = new AbortController()
@@ -35,7 +39,6 @@ const extractErrorMessage = async (res) => {
     const data = await res.json()
     if (data) {
       if (Array.isArray(data.detail)) {
-        // FastAPI validation error array
         const first = data.detail[0]
         return first?.msg || 'Validation error'
       }
@@ -59,93 +62,144 @@ export function AuthProvider({ children }) {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
   const [apiStatus, setApiStatus] = useState(null)
+  const [apiBase, setApiBase] = useState('')
+  const triedFallbackRef = useRef(false)
 
+  // Resolve the best API base by probing candidates
   useEffect(() => {
-    // Quick reachability check for diagnostics
-    fetchWithTimeout(`${API_BASE}/test`, { method: 'GET' }, 6000)
-      .then(async (r) => {
-        const ok = r.ok
-        let body = null
-        try { body = await r.json() } catch(_) {}
-        setApiStatus({ ok, body })
-        console.debug('[PixelPicks] API base:', API_BASE, 'status:', ok, 'body:', body)
-      })
-      .catch((e) => {
-        setApiStatus({ ok: false, error: String(e) })
-        console.warn('[PixelPicks] API probe failed:', e, 'base:', API_BASE)
-      })
+    let cancelled = false
+    const candidates = inferApiBaseCandidates()
 
+    async function probeAndSelect() {
+      for (const base of candidates) {
+        try {
+          const r = await fetchWithTimeout(`${base}/test`, { method: 'GET' }, 6000)
+          const ok = r.ok
+          let body = null
+          try { body = await r.json() } catch(_) {}
+          if (!cancelled && ok) {
+            setApiBase(base)
+            setApiStatus({ ok, body })
+            console.debug('[PixelPicks] Selected API base:', base, 'status:', ok, 'body:', body)
+            return
+          }
+        } catch (e) {
+          // try next candidate
+          console.warn('[PixelPicks] Probe failed for', base, e)
+        }
+      }
+      // If none worked, still set to first for visibility
+      if (!cancelled) {
+        const first = candidates[0] || ''
+        setApiBase(first)
+        setApiStatus({ ok: false, error: 'Unreachable' })
+        console.warn('[PixelPicks] No API base reachable. Tried:', candidates)
+      }
+    }
+
+    probeAndSelect()
+
+    return () => { cancelled = true }
+  }, [])
+
+  const fetchMe = async (tkn, base) => {
+    const b = base || apiBase
+    const res = await fetchWithTimeout(`${b}/auth/me`, {
+      headers: { Authorization: `Bearer ${tkn}` },
+    })
+    if (!res.ok) throw new Error('Unable to fetch profile')
+    const data = await res.json()
+    setUser(data)
+    return data
+  }
+
+  // Load token after apiBase is determined
+  useEffect(() => {
+    if (!apiBase) return
     const stored = localStorage.getItem('pp_token')
     if (stored) {
       setToken(stored)
-      fetchMe(stored).finally(() => setLoading(false))
+      fetchMe(stored, apiBase).finally(() => setLoading(false))
     } else {
       setLoading(false)
     }
-  }, [])
+  }, [apiBase])
 
-  const fetchMe = async (tkn) => {
+  const networkErrorMessage = (base) => `Cannot reach the server at ${base}. Please check Status below and try again.`
+
+  // Attempt auth request; on network error, try a fallback base once
+  const withFallback = async (fn) => {
     try {
-      const res = await fetchWithTimeout(`${API_BASE}/auth/me`, {
-        headers: { Authorization: `Bearer ${tkn}` },
-      })
-      if (!res.ok) throw new Error('Unable to fetch profile')
-      const data = await res.json()
-      setUser(data)
-      return data
+      return await fn(apiBase)
     } catch (e) {
-      setUser(null)
-      localStorage.removeItem('pp_token')
-      setToken(null)
-      throw e
+      const isNetwork = e?.name === 'AbortError' || /Failed to fetch|NetworkError|TypeError/i.test(String(e))
+      if (!isNetwork) throw e
+      if (triedFallbackRef.current) throw new Error(networkErrorMessage(apiBase))
+
+      // Try alternate candidate
+      const candidates = inferApiBaseCandidates().filter((b) => b !== apiBase)
+      for (const cand of candidates) {
+        try {
+          // quick probe
+          await fetchWithTimeout(`${cand}/test`, { method: 'GET' }, 4000)
+          triedFallbackRef.current = true
+          setApiBase(cand)
+          return await fn(cand)
+        } catch(_) { /* try next */ }
+      }
+      throw new Error(networkErrorMessage(apiBase))
     }
   }
 
   const login = async (email, password) => {
     setError('')
-    try {
-      const res = await fetchWithTimeout(`${API_BASE}/auth/login-json`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email, password })
-      })
-      if (!res.ok) {
-        const msg = await extractErrorMessage(res)
-        setError(msg)
-        throw new Error(msg)
+    return withFallback(async (base) => {
+      try {
+        const res = await fetchWithTimeout(`${base}/auth/login-json`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ email, password })
+        })
+        if (!res.ok) {
+          const msg = await extractErrorMessage(res)
+          setError(msg)
+          throw new Error(msg)
+        }
+        const data = await res.json()
+        localStorage.setItem('pp_token', data.access_token)
+        setToken(data.access_token)
+        await fetchMe(data.access_token, base)
+      } catch (e) {
+        if (!e.message) e.message = networkErrorMessage(base)
+        console.error('Login error:', e)
+        setError(e.message)
+        throw e
       }
-      const data = await res.json()
-      localStorage.setItem('pp_token', data.access_token)
-      setToken(data.access_token)
-      await fetchMe(data.access_token)
-    } catch (e) {
-      console.error('Login error:', e)
-      // Preserve specific error message if available
-      setError(e?.message || 'Login failed. Please try again.')
-      throw e
-    }
+    })
   }
 
   const register = async (name, email, password) => {
     setError('')
-    try {
-      const res = await fetchWithTimeout(`${API_BASE}/auth/register`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name, email, password })
-      })
-      if (!res.ok) {
-        const msg = await extractErrorMessage(res)
-        setError(msg)
-        throw new Error(msg)
+    return withFallback(async (base) => {
+      try {
+        const res = await fetchWithTimeout(`${base}/auth/register`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name, email, password })
+        })
+        if (!res.ok) {
+          const msg = await extractErrorMessage(res)
+          setError(msg)
+          throw new Error(msg)
+        }
+        await login(email, password)
+      } catch (e) {
+        if (!e.message) e.message = networkErrorMessage(base)
+        console.error('Registration error:', e)
+        setError(e.message)
+        throw e
       }
-      await login(email, password)
-    } catch (e) {
-      console.error('Registration error:', e)
-      // Preserve specific error message if available
-      setError(e?.message || 'Registration failed. Please check your details and try again.')
-      throw e
-    }
+    })
   }
 
   const logout = () => {
@@ -154,7 +208,7 @@ export function AuthProvider({ children }) {
     setUser(null)
   }
 
-  const value = useMemo(() => ({ user, token, loading, error, login, register, logout, API_BASE, apiStatus }), [user, token, loading, error, apiStatus])
+  const value = useMemo(() => ({ user, token, loading, error, login, register, logout, API_BASE: apiBase, apiStatus }), [user, token, loading, error, apiStatus, apiBase])
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>
 }
