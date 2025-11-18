@@ -30,13 +30,51 @@ async function fetchWithTimeout(resource, options = {}, timeoutMs = 12000) {
   }
 }
 
+const extractErrorMessage = async (res) => {
+  try {
+    const data = await res.json()
+    if (data) {
+      if (Array.isArray(data.detail)) {
+        // FastAPI validation error array
+        const first = data.detail[0]
+        return first?.msg || 'Validation error'
+      }
+      if (typeof data.detail === 'string') return data.detail
+      if (typeof data.message === 'string') return data.message
+      if (typeof data.error === 'string') return data.error
+      if (typeof data === 'string') return data
+    }
+  } catch (_) {
+    try {
+      const text = await res.text()
+      if (text) return text
+    } catch (_) {}
+  }
+  return 'Request failed'
+}
+
 export function AuthProvider({ children }) {
   const [user, setUser] = useState(null)
   const [token, setToken] = useState(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
+  const [apiStatus, setApiStatus] = useState(null)
 
   useEffect(() => {
+    // Quick reachability check for diagnostics
+    fetchWithTimeout(`${API_BASE}/test`, { method: 'GET' }, 6000)
+      .then(async (r) => {
+        const ok = r.ok
+        let body = null
+        try { body = await r.json() } catch(_) {}
+        setApiStatus({ ok, body })
+        console.debug('[PixelPicks] API base:', API_BASE, 'status:', ok, 'body:', body)
+      })
+      .catch((e) => {
+        setApiStatus({ ok: false, error: String(e) })
+        console.warn('[PixelPicks] API probe failed:', e, 'base:', API_BASE)
+      })
+
     const stored = localStorage.getItem('pp_token')
     if (stored) {
       setToken(stored)
@@ -72,7 +110,7 @@ export function AuthProvider({ children }) {
         body: JSON.stringify({ email, password })
       })
       if (!res.ok) {
-        const msg = (await res.json().catch(() => ({}))).detail || 'Login failed'
+        const msg = await extractErrorMessage(res)
         setError(msg)
         throw new Error(msg)
       }
@@ -96,7 +134,7 @@ export function AuthProvider({ children }) {
         body: JSON.stringify({ name, email, password })
       })
       if (!res.ok) {
-        const msg = (await res.json().catch(() => ({}))).detail || 'Registration failed'
+        const msg = await extractErrorMessage(res)
         setError(msg)
         throw new Error(msg)
       }
@@ -114,7 +152,7 @@ export function AuthProvider({ children }) {
     setUser(null)
   }
 
-  const value = useMemo(() => ({ user, token, loading, error, login, register, logout, API_BASE }), [user, token, loading, error])
+  const value = useMemo(() => ({ user, token, loading, error, login, register, logout, API_BASE, apiStatus }), [user, token, loading, error, apiStatus])
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>
 }
