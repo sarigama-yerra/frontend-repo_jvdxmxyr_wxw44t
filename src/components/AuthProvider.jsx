@@ -120,7 +120,8 @@ export function AuthProvider({ children }) {
       await fetchMe(data.access_token)
     } catch (e) {
       console.error('Login error:', e)
-      if (!error) setError('Login failed. Please try again.')
+      // Preserve specific error message if available
+      setError(e?.message || 'Login failed. Please try again.')
       throw e
     }
   }
@@ -141,7 +142,8 @@ export function AuthProvider({ children }) {
       await login(email, password)
     } catch (e) {
       console.error('Registration error:', e)
-      if (!error) setError('Registration failed. Please check your details and try again.')
+      // Preserve specific error message if available
+      setError(e?.message || 'Registration failed. Please check your details and try again.')
       throw e
     }
   }

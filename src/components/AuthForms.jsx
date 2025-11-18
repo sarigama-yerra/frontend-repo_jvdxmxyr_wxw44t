@@ -2,7 +2,7 @@ import { useState } from 'react'
 import { useAuth } from './AuthProvider'
 
 export default function AuthForms() {
-  const { user, loading, error, login, register, logout } = useAuth()
+  const { user, loading, error, login, register, logout, apiStatus, API_BASE } = useAuth()
   const [mode, setMode] = useState('login')
   const [name, setName] = useState('')
   const [email, setEmail] = useState('')
@@ -63,6 +63,16 @@ export default function AuthForms() {
         {error && <p className="text-red-400 text-sm">{error}</p>}
         <button disabled={busy} className="w-full bg-blue-500 hover:bg-blue-600 disabled:opacity-60 text-white font-medium py-2 rounded transition">{busy? 'Please wait...' : (mode==='login' ? 'Log in' : 'Create account')}</button>
       </form>
+
+      {/* Diagnostics (non-intrusive) */}
+      <div className="mt-4 text-xs text-blue-200/60 space-y-1">
+        <p>Server: <span className="text-blue-300">{API_BASE}</span></p>
+        {apiStatus && (
+          apiStatus.ok
+            ? <p>Status: <span className="text-green-400">OK</span>{apiStatus.body?.database ? ` • DB: ${apiStatus.body.database}` : ''}</p>
+            : <p>Status: <span className="text-red-400">Unavailable</span>{apiStatus.error ? ` • ${apiStatus.error}` : ''}</p>
+        )}
+      </div>
     </div>
   )
 }
